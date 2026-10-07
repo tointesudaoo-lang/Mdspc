@@ -1,0 +1,276 @@
+name: Titan Cloud PC - Windows + Tailscale + RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp:
+    name: Windows RDP
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # 1. PREPARAR WINDOWS
+      # ============================================================
+      - name: Configurar Windows para RDP
+        shell: powershell
+        run: |
+          Write-Host "========================================="
+          Write-Host " TITAN CLOUD PC"
+          Write-Host " Configurando Windows..."
+          Write-Host "========================================="
+
+          # Ativar Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Permitir conexões RDP com NLA
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Ativar serviço RDP
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          # Ativar regras padrão do firewall para RDP
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP ativado."
+
+      # ============================================================
+      # 2. CRIAR USUARIO RDP
+      # ============================================================
+      - name: Criar usuário RDP
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $Username = "WinRemote"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            Write-Error "O Secret RDP_PASSWORD não foi configurado."
+            exit 1
+          }
+
+          $SecurePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+
+          if ($ExistingUser) {
+            Set-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword `
+              -FullName "Titan Cloud PC" `
+              -Description "Conta para acesso RDP"
+          }
+
+          # Adicionar ao grupo Remote Desktop Users
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Usuário RDP configurado."
+
+      # ============================================================
+      # 3. INSTALAR TAILSCALE
+      # ============================================================
+      - name: Instalar Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Baixando Tailscale..."
+
+          $Installer = "$env:TEMP\tailscale-setup.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $Installer
+
+          Write-Host "Instalando Tailscale..."
+
+          Start-Process `
+            -FilePath $Installer `
+            -ArgumentList "/quiet" `
+            -Wait `
+            -NoNewWindow
+
+          Start-Sleep -Seconds 5
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+            Write-Error "Tailscale não foi instalado corretamente."
+            exit 1
+          }
+
+          Write-Host "Tailscale instalado."
+
+      # ============================================================
+      # 4. CONECTAR TAILSCALE
+      # ============================================================
+      - name: Conectar ao Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            Write-Error "O Secret TAILSCALE_AUTHKEY não foi configurado."
+            exit 1
+          }
+
+          Write-Host "Conectando ao Tailscale..."
+
+          & $Tailscale up `
+            --auth-key="$env:TS_AUTHKEY" `
+            --hostname="titan-cloud-pc"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Falha ao conectar ao Tailscale."
+            exit 1
+          }
+
+          Start-Sleep -Seconds 5
+
+          Write-Host "Tailscale conectado."
+
+      # ============================================================
+      # 5. DESCOBRIR IP TAILSCALE
+      # ============================================================
+      - name: Obter IP Tailscale
+        shell: powershell
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $IPv4 = & $Tailscale ip -4
+
+          if ([string]::IsNullOrWhiteSpace($IPv4)) {
+            Write-Error "Não foi possível obter o IP Tailscale."
+            exit 1
+          }
+
+          $IPv4 = $IPv4.Trim()
+
+          "TAILSCALE_IP=$IPv4" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " IP TAILSCALE:"
+          Write-Host " $IPv4"
+          Write-Host "========================================="
+
+      # ============================================================
+      # 6. CONFIGURAR FIREWALL
+      # ============================================================
+      - name: Proteger RDP pelo Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Configurando firewall..."
+
+          # Remover regras públicas existentes do grupo RDP
+          Disable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          # Liberar RDP somente pela interface Tailscale
+          New-NetFirewallRule `
+            -DisplayName "Titan Cloud PC - RDP via Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -InterfaceAlias "Tailscale" `
+            -Profile Any `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Firewall configurado."
+
+      # ============================================================
+      # 7. TESTAR RDP
+      # ============================================================
+      - name: Verificar RDP
+        shell: powershell
+        run: |
+          Write-Host "Verificando serviço RDP..."
+
+          $Service = Get-Service -Name TermService
+
+          if ($Service.Status -ne "Running") {
+            Write-Error "O serviço RDP não está executando."
+            exit 1
+          }
+
+          $Port = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $Port) {
+            Write-Error "A porta 3389 não está escutando."
+            exit 1
+          }
+
+          Write-Host "RDP funcionando."
+
+      # ============================================================
+      # 8. MOSTRAR INFORMACOES
+      # ============================================================
+      - name: Informações da máquina
+        shell: powershell
+        run: |
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "        TITAN CLOUD PC ONLINE"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Windows : $env:COMPUTERNAME"
+          Write-Host "Usuário : WinRemote"
+          Write-Host "RDP     : 3389"
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "ENDEREÇO PARA RDP:"
+          Write-Host "$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "=============================================="
+
+          Write-Host ""
+          Write-Host "Status Tailscale:"
+          & $Tailscale status
+
+      # ============================================================
+      # 9. MANTER O RUNNER ONLINE
+      # ============================================================
+      - name: Manter PC disponível
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " TITAN CLOUD PC ESTÁ ONLINE"
+          Write-Host "=============================================="
+          Write-Host "IP Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Usuário RDP : WinRemote"
+          Write-Host ""
+          Write-Host "Não encerre este workflow enquanto estiver"
+          Write-Host "usando o PC."
+          Write-Host "=============================================="
+
+          while ($true) {
+            Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - PC online"
+            Start-Sleep -Seconds 60
+          }
